@@ -1,13 +1,14 @@
 """
-Main FastAPI application entry point.
+main.py
 
-Run with:
-    uvicorn app.main:app --reload
+Entry point. Run with: uvicorn app.main:app --reload
+
+I'm using the lifespan context manager instead of on_event("startup") because
+that's the recommended way in newer FastAPI versions (on_event is deprecated).
 """
 
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,30 +21,22 @@ from app.routers.attendance import router as attendance_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm up the MongoDB connection on startup
-    get_client()
+    get_client()  # init the mongo connection on startup
     yield
-    # Clean up on shutdown
-    await close_client()
+    await close_client()  # clean shutdown
 
 
 app = FastAPI(
     title="Employee Attendance & Analytics API",
     description=(
-        "A small but complete attendance tracking service built with FastAPI and MongoDB. "
-        "Supports punch-in / punch-out with business-rule validation, admin corrections "
-        "with a full audit trail, and several analytics endpoints powered by MongoDB "
-        "aggregation pipelines."
+        "Handles employee punch-in/out with business rules, manual corrections "
+        "with audit trail, and analytics via MongoDB aggregation pipelines."
     ),
     version="1.0.0",
-    contact={
-        "name": "Harsh",
-        "email": "your-email@example.com",
-    },
     lifespan=lifespan,
 )
 
-# Allow all origins for demo; in production you'd lock this down.
+# allowing all origins for now since this is just a demo
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

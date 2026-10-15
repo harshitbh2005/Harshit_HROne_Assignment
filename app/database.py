@@ -1,6 +1,11 @@
 """
-MongoDB connection setup using Motor (async driver).
-We use a single shared client and expose collection accessors.
+database.py
+
+Setting up the MongoDB connection using Motor (async pymongo wrapper).
+Keeping the client as a module-level singleton - no point creating a new
+connection for every request, that would be wasteful.
+
+Motor docs: https://motor.readthedocs.io/en/stable/
 """
 
 import os
@@ -9,7 +14,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 DB_NAME   = os.getenv("DB_NAME", "hrone_attendance")
 
-# Created once at startup, reused for the entire app lifetime.
+# single client for the whole app lifetime
 _client: AsyncIOMotorClient | None = None
 
 
@@ -24,7 +29,7 @@ def get_db():
     return get_client()[DB_NAME]
 
 
-# Collection helpers – keeps collection names in one place
+# just shortcuts so I don't have to type get_db()["attendance_logs"] everywhere
 def attendance_col():
     return get_db()["attendance_logs"]
 

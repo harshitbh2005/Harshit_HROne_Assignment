@@ -1,7 +1,11 @@
 """
-Analytics router — all endpoints use MongoDB aggregation pipelines.
-We push as much computation into MongoDB as possible rather than
-pulling raw data into Python and crunching it there.
+analytics.py
+
+All the reporting endpoints. The important thing here is that all the heavy
+lifting is done inside MongoDB using aggregation pipelines - not in Python.
+
+Fetching thousands of records into Python just to sum them up is slow and
+wasteful. MongoDB's aggregation framework handles this much better.
 """
 
 from __future__ import annotations
@@ -15,12 +19,8 @@ from app.database import attendance_col, employees_col
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
 def _month_date_range(year: int, month: int) -> tuple[str, str]:
-    """Return ISO date strings for the first and last day of the month."""
+    """returns first and last date of a given month as ISO strings"""
     import calendar
     last_day = calendar.monthrange(year, month)[1]
     start = f"{year}-{month:02d}-01"
@@ -28,27 +28,29 @@ def _month_date_range(year: int, month: int) -> tuple[str, str]:
     return start, end
 
 
-# ---------------------------------------------------------------------------
-# 1. Working hours summary for an employee over a month
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 1. Total working hours for an employee in a month
+# -----------------------------------------------------------------------
 
 @router.get(
     "/hours/{employee_id}",
-    summary="Total working hours for an employee in a given month",
+    summary="Monthly working hours summary for an employee",
 )
 async def working_hours_summary(
     employee_id: str,
     year:  int = Query(..., description="e.g. 2026"),
-    month: int = Query(..., ge=1, le=12, description="1-12"),
+    month: int = Query(..., ge=1, le=12),
 ):
     start, end = _month_date_range(year, month)
 
+    # filter to this employee + month, then group and sum working_minutes
+    # $round to 2 decimal places so we don't get 176.666666... hours
     pipeline = [
         {
             "$match": {
                 "employee_id": employee_id,
                 "date": {"$gte": start, "$lte": end},
-                "working_minutes": {"$ne": None},
+                "working_minutes": {"$ne": None},  # skip records with no punch-out yet
             }
         },
         {
@@ -77,6 +79,8 @@ async def working_hours_summary(
     ]
 
     results = await attendance_col().aggregate(pipeline).to_list(length=1)
+
+    # return zeros if employee has no records for that month
     if not results:
         return {
             "employee_id": employee_id,
@@ -86,24 +90,25 @@ async def working_hours_summary(
             "period_start": start,
             "period_end": end,
         }
+
     data = results[0]
     data["period_start"] = start
     data["period_end"]   = end
     return data
 
 
-# ---------------------------------------------------------------------------
-# 2. Late arrivals for a specific date range
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 2. Late arrivals in a date range
+# -----------------------------------------------------------------------
 
 @router.get(
     "/late-arrivals",
-    summary="List employees who arrived late in a date range",
+    summary="Who came late, and when",
 )
 async def late_arrivals(
-    start_date: str = Query(..., description="ISO date, e.g. 2026-10-01"),
-    end_date:   str = Query(..., description="ISO date, e.g. 2026-10-15"),
-    employee_id: Optional[str] = Query(None, description="Filter to a single employee"),
+    start_date: str = Query(..., description="e.g. 2026-10-01"),
+    end_date:   str = Query(..., description="e.g. 2026-10-15"),
+    employee_id: Optional[str] = Query(None, description="filter to one employee"),
 ):
     match_stage: dict = {
         "date":   {"$gte": start_date, "$lte": end_date},
@@ -133,23 +138,21 @@ async def late_arrivals(
     return {"late_arrivals": docs, "count": len(docs)}
 
 
-# ---------------------------------------------------------------------------
-# 3. Absent employees on a given date
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 3. Who was absent on a specific date
+# -----------------------------------------------------------------------
 
 @router.get(
     "/absent/{date}",
-    summary="List employees who were absent on a specific date",
+    summary="List employees who didn't show up on a given date",
 )
-async def absent_employees(
-    date: str,  # e.g. "2026-10-15"
-):
-    # All employees
+async def absent_employees(date: str):
+    # get all registered employees
     all_emps_cursor = employees_col().find({}, {"employee_id": 1, "name": 1, "_id": 0})
     all_emps = await all_emps_cursor.to_list(length=1000)
     all_ids = {e["employee_id"] for e in all_emps}
 
-    # Employees who have a record for this date
+    # get everyone who has any attendance record on that date
     pipeline = [
         {"$match": {"date": date}},
         {"$group": {"_id": "$employee_id"}},
@@ -157,6 +160,7 @@ async def absent_employees(
     present_raw = await attendance_col().aggregate(pipeline).to_list(length=1000)
     present_ids = {r["_id"] for r in present_raw}
 
+    # whoever isn't in present_ids was absent
     absent_ids = all_ids - present_ids
 
     emp_map = {e["employee_id"]: e.get("name", "") for e in all_emps}
@@ -168,21 +172,22 @@ async def absent_employees(
     return {"date": date, "absent_employees": absent, "count": len(absent)}
 
 
-# ---------------------------------------------------------------------------
-# 4. Department-wise attendance summary for a month
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 4. Department-wise attendance summary
+# -----------------------------------------------------------------------
 
 @router.get(
     "/department-summary",
-    summary="Average attendance hours grouped by department for a given month",
+    summary="Attendance stats grouped by department for a month",
 )
 async def department_summary(
-    year:  int = Query(..., description="e.g. 2026"),
+    year:  int = Query(...),
     month: int = Query(..., ge=1, le=12),
 ):
     start, end = _month_date_range(year, month)
 
-    # We join attendance_logs with employees on employee_id using $lookup
+    # $lookup is basically a JOIN - pulling in department info from employees collection
+    # this is more efficient than doing it in Python with two separate queries
     pipeline = [
         {
             "$match": {
@@ -202,7 +207,7 @@ async def department_summary(
         {
             "$group": {
                 "_id": "$emp_info.department",
-                "total_employees": {"$addToSet": "$employee_id"},
+                "total_employees": {"$addToSet": "$employee_id"},  # addToSet = unique count
                 "total_days_present": {"$sum": 1},
                 "total_minutes": {"$sum": "$working_minutes"},
             }
@@ -232,13 +237,13 @@ async def department_summary(
     }
 
 
-# ---------------------------------------------------------------------------
-# 5. Individual employee report — daily breakdown for a month
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# 5. Day-by-day breakdown for one employee in a month
+# -----------------------------------------------------------------------
 
 @router.get(
     "/employee-report/{employee_id}",
-    summary="Day-by-day attendance breakdown for an employee",
+    summary="Full month breakdown - each day with punch times and status",
 )
 async def employee_monthly_report(
     employee_id: str,

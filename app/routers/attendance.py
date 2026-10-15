@@ -1,5 +1,8 @@
 """
-Attendance router — punch-in, punch-out, manual correction, record retrieval.
+attendance.py - router for all punch-in/out and correction stuff
+
+Keeping the routes thin - actual logic is in services.py.
+These just validate the request and call the right function.
 """
 
 from __future__ import annotations
@@ -17,9 +20,8 @@ from app.services import manual_correction, punch_in, punch_out
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 
 
-# ---------------------------------------------------------------------------
-# Employee management (lightweight, just enough to satisfy the FK check)
-# ---------------------------------------------------------------------------
+# --- employee registration ---
+# keeping this here instead of a separate employees router to keep things simple
 
 @router.post(
     "/employees",
@@ -43,53 +45,35 @@ async def list_employees():
     return {"employees": await cursor.to_list(length=500)}
 
 
-# ---------------------------------------------------------------------------
-# Punch-in
-# ---------------------------------------------------------------------------
+# --- punch in ---
 
 @router.post(
     "/punch-in",
     status_code=status.HTTP_201_CREATED,
     summary="Record employee punch-in",
-    description=(
-        "Creates a new attendance record for today. "
-        "Returns 400 if the employee has already punched in today."
-    ),
 )
 async def record_punch_in(body: PunchRequest):
     result = await punch_in(body.employee_id, body.timestamp, body.notes)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Punch-out
-# ---------------------------------------------------------------------------
+# --- punch out ---
 
 @router.post(
     "/punch-out",
     status_code=status.HTTP_200_OK,
     summary="Record employee punch-out",
-    description=(
-        "Closes the open attendance record for today and calculates working hours. "
-        "Returns 400 if there is no open punch-in."
-    ),
 )
 async def record_punch_out(body: PunchRequest):
     result = await punch_out(body.employee_id, body.timestamp, body.notes)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Manual correction
-# ---------------------------------------------------------------------------
+# --- manual correction ---
 
 @router.patch(
     "/records/{record_id}/correct",
-    summary="Manually correct an attendance record",
-    description=(
-        "Admin-level endpoint to fix incorrect punch times. "
-        "Every correction is appended to the document's audit_trail array."
-    ),
+    summary="Manually correct an attendance record (admin only)",
 )
 async def correct_record(
     record_id: str = Path(..., description="MongoDB ObjectId of the attendance record"),
@@ -105,24 +89,24 @@ async def correct_record(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Record retrieval
-# ---------------------------------------------------------------------------
+# --- fetching records ---
 
 @router.get(
     "/records/{record_id}",
-    summary="Fetch a single attendance record",
+    summary="Get a single attendance record by ID",
 )
 async def get_record(record_id: str = Path(...)):
     try:
         oid = ObjectId(record_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid record ID.")
+
     doc = await attendance_col().find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Record not found.")
+
     doc["_id"] = str(doc["_id"])
-    # Serialise any nested datetime objects so FastAPI can JSON-encode them
+    # convert datetimes to strings so JSON doesn't complain
     for k, v in doc.items():
         if isinstance(v, datetime):
             doc[k] = v.isoformat()
@@ -136,11 +120,11 @@ async def get_record(record_id: str = Path(...)):
 
 @router.get(
     "/records",
-    summary="List attendance records with optional filters",
+    summary="List records - filter by employee_id or date",
 )
 async def list_records(
     employee_id: Optional[str] = Query(None),
-    date: Optional[str]        = Query(None, description="ISO date string, e.g. 2026-10-15"),
+    date: Optional[str]        = Query(None, description="e.g. 2026-10-15"),
     skip: int                  = Query(0, ge=0),
     limit: int                 = Query(50, ge=1, le=500),
 ):

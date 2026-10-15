@@ -1,8 +1,12 @@
 """
-Business logic for attendance operations.
+services.py
 
-Keeping the logic out of the routers makes it easier to test and
-easier to talk through in the live review.
+This is where the actual business logic lives. I kept it separate from the
+routers so it's easier to test and also easier to explain what each thing does.
+
+All times are stored in IST. Took me a bit to decide between storing UTC vs IST
+but since all employees are in India it makes more sense to just work in IST
+throughout and not deal with conversions everywhere.
 """
 
 from __future__ import annotations
@@ -18,21 +22,20 @@ from app.database import attendance_col, employees_col
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# Anything more than 15 minutes after shift start is considered late.
+# 15 min grace period - if you punch in at 9:44 you're fine, 9:46 you're late
 LATE_THRESHOLD_MINUTES = 15
 
-# Minimum working hours in a day to count as "present" (not half-day)
+# less than 4 hours = half day. felt like a reasonable cutoff
 MIN_HOURS_FULL_DAY = 4.0
 
 
 def _now_ist() -> datetime:
-    """Return current time as timezone-aware datetime in IST."""
     return datetime.now(IST)
 
 
 def _to_ist(dt: datetime) -> datetime:
+    # if no timezone info assume it came in as UTC (motor returns naive datetimes sometimes)
     if dt.tzinfo is None:
-        # Assume UTC when no tzinfo is given (common for stored datetimes)
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST)
 
@@ -42,13 +45,12 @@ async def _get_employee(employee_id: str) -> dict:
     if not emp:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Employee '{employee_id}' not found. Add them first via POST /employees."
+            detail=f"Employee '{employee_id}' not found. Register them first via POST /attendance/employees."
         )
     return emp
 
 
 async def _get_last_record_today(employee_id: str) -> Optional[dict]:
-    """Return today's attendance document for this employee, if any."""
     today = _now_ist().date().isoformat()
     return await attendance_col().find_one(
         {"employee_id": employee_id, "date": today}
@@ -56,14 +58,6 @@ async def _get_last_record_today(employee_id: str) -> Optional[dict]:
 
 
 async def punch_in(employee_id: str, timestamp: Optional[datetime], notes: Optional[str]) -> dict:
-    """
-    Record a punch-in.
-
-    Business rules:
-    - Employee must exist.
-    - Can't punch in twice on the same day without punching out first.
-    - If punch_in time is more than LATE_THRESHOLD_MINUTES after shift start, mark as LATE.
-    """
     emp = await _get_employee(employee_id)
 
     punch_time = timestamp if timestamp else _now_ist()
@@ -73,18 +67,22 @@ async def punch_in(employee_id: str, timestamp: Optional[datetime], notes: Optio
     today = punch_time_ist.date().isoformat()
 
     existing = await attendance_col().find_one({"employee_id": employee_id, "date": today})
+
+    # already punched in but hasn't punched out yet
     if existing and existing.get("punch_in") and not existing.get("punch_out"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Already punched in today. Please punch out first."
         )
+
+    # both punch in and out already done for today
     if existing and existing.get("punch_in") and existing.get("punch_out"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Already completed attendance for today (both punch-in and punch-out recorded)."
+            detail="Attendance already completed for today."
         )
 
-    # Figure out late status
+    # check if they're late
     shift_start_str = emp.get("shift_start", "09:30")
     sh, sm = map(int, shift_start_str.split(":"))
     shift_start_dt = punch_time_ist.replace(hour=sh, minute=sm, second=0, microsecond=0)
@@ -115,15 +113,6 @@ async def punch_in(employee_id: str, timestamp: Optional[datetime], notes: Optio
 
 
 async def punch_out(employee_id: str, timestamp: Optional[datetime], notes: Optional[str]) -> dict:
-    """
-    Record a punch-out.
-
-    Business rules:
-    - Must have a punch-in for today first.
-    - Can't punch out twice.
-    - Working minutes are calculated and stored.
-    - If working < MIN_HOURS_FULL_DAY we downgrade status to HALF_DAY.
-    """
     punch_time = timestamp if timestamp else _now_ist()
     if punch_time.tzinfo is None:
         punch_time = punch_time.replace(tzinfo=IST)
@@ -135,8 +124,9 @@ async def punch_out(employee_id: str, timestamp: Optional[datetime], notes: Opti
     if not record:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No punch-in found for today. Please punch in first."
+            detail="No punch-in found for today. You need to punch in first."
         )
+
     if record.get("punch_out"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -148,19 +138,20 @@ async def punch_out(employee_id: str, timestamp: Optional[datetime], notes: Opti
         punch_in_time = punch_in_time.replace(tzinfo=timezone.utc)
     punch_in_ist = _to_ist(punch_in_time)
 
+    # sanity check - punch out can't be before punch in
     if punch_time_ist < punch_in_ist:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Punch-out time cannot be before punch-in time."
+            detail="Punch-out time can't be before punch-in time."
         )
 
     working_minutes = int((punch_time_ist - punch_in_ist).total_seconds() / 60)
+
+    # downgrade to half day if they didn't work enough hours
+    # but keep LATE status if it was already set
     current_status = record.get("status", "PRESENT")
-    if working_minutes < MIN_HOURS_FULL_DAY * 60:
-        # Override status to HALF_DAY if they didn't work enough hours,
-        # but preserve LATE if it was already set
-        if current_status not in ("LATE",):
-            current_status = "HALF_DAY"
+    if working_minutes < MIN_HOURS_FULL_DAY * 60 and current_status not in ("LATE",):
+        current_status = "HALF_DAY"
 
     await attendance_col().update_one(
         {"_id": record["_id"]},
@@ -191,18 +182,20 @@ async def manual_correction(
     new_punch_out: Optional[datetime],
 ) -> dict:
     """
-    Allow an admin to fix punch times.
-    Every change is appended to the audit_trail array in the document.
+    Admin can fix wrong punch times here.
+    Whatever they change, we log the old values before overwriting - that's the audit trail.
+    Using $push so each correction appends to the array, not replaces.
     """
     try:
         oid = ObjectId(record_id)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid record ID format.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That doesn't look like a valid record ID.")
 
     record = await attendance_col().find_one({"_id": oid})
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found.")
 
+    # save what it looked like before the change
     audit_entry = {
         "corrected_by": corrected_by,
         "corrected_at": _now_ist(),
@@ -214,6 +207,7 @@ async def manual_correction(
     }
 
     update_fields: dict = {"is_manual_corrected": True}
+
     if new_punch_in:
         pi = _to_ist(new_punch_in) if new_punch_in.tzinfo else new_punch_in.replace(tzinfo=IST)
         update_fields["punch_in"] = pi
@@ -221,7 +215,7 @@ async def manual_correction(
         po = _to_ist(new_punch_out) if new_punch_out.tzinfo else new_punch_out.replace(tzinfo=IST)
         update_fields["punch_out"] = po
 
-    # Recalculate working minutes if we have both times after correction
+    # recalculate working minutes with the corrected times
     final_in  = update_fields.get("punch_in",  record.get("punch_in"))
     final_out = update_fields.get("punch_out", record.get("punch_out"))
     if final_in and final_out:
@@ -231,6 +225,7 @@ async def manual_correction(
             final_out = final_out.replace(tzinfo=timezone.utc)
         update_fields["working_minutes"] = int((final_out - final_in).total_seconds() / 60)
 
+    # $set updates the fields, $push appends the audit entry - single DB call
     await attendance_col().update_one(
         {"_id": oid},
         {
